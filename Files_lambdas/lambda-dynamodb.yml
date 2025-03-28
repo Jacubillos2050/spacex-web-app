@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Plantilla para crear una función Lambda que procesa lanzamientos de SpaceX y los almacena en DynamoDB
+
+Resources:
+  LaunchTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: SpaceXLaunches
+      AttributeDefinitions:
+        - AttributeName: launch_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: launch_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: SpaceXLaunchProcessor
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 300  # 5 minutos para procesar todos los lanzamientos
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import requests
+          import boto3
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('SpaceXLaunches')
+
+          def get_rockets():
+              try:
+                  response = requests.get('https://api.spacexdata.com/v4/rockets')
+                  response.raise_for_status()
+                  rockets = response.json()
+                  return {rocket['id']: rocket['name'] for rocket in rockets}
+              except requests.RequestException as e:
+                  print(f"Error al obtener cohetes: {str(e)}")
+                  return {}
+
+          def get_launches():
+              try:
+                  response = requests.get('https://api.spacexdata.com/v4/launches')
+                  response.raise_for_status()
+                  return response.json()
+              except requests.RequestException as e:
+                  print(f"Error al obtener lanzamientos: {str(e)}")
+                  return []
+
+          def determine_status(launch_date_utc, success):
+              if not launch_date_utc:
+                  return 'upcoming'
+              launch_date = datetime.strptime(launch_date_utc, '%Y-%m-%dT%H:%M:%S.%fZ')
+              current_date = datetime.utcnow()
+              if launch_date > current_date:
+                  return 'upcoming'
+              return 'success' if success else 'failed'
+
+          def lambda_handler(event, context):
+              is_manual = not event
+              rocket_names = get_rockets()
+              launches = get_launches()
+              new_count = 0
+              updated_count = 0
+              processed_launches = []
+
+              for launch in launches:
+                  launch_id = launch.get('id', '')
+                  if not launch_id:
+                      continue
+
+                  mission_name = launch.get('name', 'Unknown')
+                  rocket_id = launch.get('rocket', '')
+                  rocket_name = rocket_names.get(rocket_id, 'Unknown')
+                  launch_date_utc = launch.get('date_utc')
+                  success = launch.get('success') if launch_date_utc else None
+                  status = determine_status(launch_date_utc, success)
+
+                  item = {
+                      'launch_id': launch_id,
+                      'mission_name': mission_name,
+                      'rocket_name': rocket_name,
+                      'launch_date': launch_date_utc if launch_date_utc else 'N/A',
+                      'status': status
+                  }
+
+                  try:
+                      existing_item = table.get_item(Key={'launch_id': launch_id}).get('Item')
+                      table.put_item(Item=item)
+                      if is_manual:
+                          processed_launches.append({
+                              'launch_id': launch_id,
+                              'mission_name': mission_name,
+                              'status': status
+                          })
+                      if not existing_item:
+                          new_count += 1
+                      else:
+                          updated_count += 1
+                  except Exception as e:
+                      print(f"Error al procesar lanzamiento {launch_id}: {str(e)}")
+
+              if is_manual:
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Procesamiento completado',
+                          'new_launches': new_count,
+                          'updated_launches': updated_count,
+                          'processed': processed_launches
+                      })
+                  }
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Procesamiento exitoso')
+              }
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource: !GetAtt LaunchTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  ScheduledRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      ScheduleExpression: rate(6 hours)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: TargetFunction
+
+  PermissionForEventsToInvokeLambda:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRule.Arn
