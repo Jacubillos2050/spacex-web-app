@@ -43,6 +43,7 @@ function App() {
   return (
     <div className="App">
       <h1>Lanzamientos de SpaceX</h1>
+      <h3>By Jairo Cubillos</h3>
       <div>
         <label>Filtrar por estado: </label>
         <select value={filter} onChange={(e) => setFilter(e.target.value)}>
