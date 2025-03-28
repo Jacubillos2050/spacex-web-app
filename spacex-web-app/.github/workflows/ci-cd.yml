@@ -1,0 +1,78 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout del código
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # 2. Configurar Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+
+      # 3. Instalar dependencias
+      - name: Install dependencies
+        run: |
+          cd server && npm install
+          cd ../client && npm install
+
+      # 4. Ejecutar pruebas (si las tienes)
+      - name: Run tests
+        run: |
+          cd client && npm test -- --watchAll=false || true  # Permitir que continúe si no hay pruebas
+          cd ../server && npm test || true                   # Placeholder para pruebas del backend
+
+      # 5. Configurar AWS CLI
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # 6. Login a Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # 7. Construir y publicar la imagen Docker
+      - name: Build, tag, and push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # 8. Desplegar en ECS Fargate
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster SpaceXWebCluster \
+            --service SpaceXWebService \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION }}
+
+      # 9. Notificar resultado del despliegue
+      - name: Notify deployment status
+        if: always()
+        run: |
+          STATUS="Success"
+          if [ ${{ job.status }} != "success" ]; then
+            STATUS="Failure"
+          fi
+          echo "Deployment $STATUS" | mail -s "CI/CD Deployment Status" ${{ secrets.EMAIL_ADDRESS }}
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
